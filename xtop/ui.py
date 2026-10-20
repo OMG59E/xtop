@@ -272,15 +272,20 @@ class App:
 
     def _colors(self) -> None:
         curses.start_color()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.use_default_colors()
+        if curses.COLORS >= 256:
+            dim = {1: 65, 2: 137, 4: 66, 5: 103, 6: 132}  # green, gold, teal, steel, plum
+            for pair, color in dim.items():
+                curses.init_pair(pair, color, -1)
+        else:
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(4, curses.COLOR_CYAN, -1)
+            curses.init_pair(5, curses.COLOR_BLUE, -1)
+            curses.init_pair(6, curses.COLOR_MAGENTA, -1)
         curses.init_pair(3, curses.COLOR_RED, -1)
-        curses.init_pair(4, curses.COLOR_CYAN, -1)
-        curses.init_pair(5, curses.COLOR_BLUE, -1)
-        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
         curses.init_pair(7, curses.COLOR_WHITE, -1)
         curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)
-        curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_WHITE)
 
     def _wait_key(self, stdscr: curses.window, timeout: float) -> int | None:
         stdscr.timeout(max(1, int(timeout * 1000)))
@@ -332,8 +337,8 @@ class App:
             return
         self._header(stdscr, w)
         rows = self._rows(w)
-        for i, line in enumerate(rows):
-            add(stdscr, 1 + i, 0, line, curses.color_pair(7), w - 1)
+        for i, (line, kind) in enumerate(rows):
+            add(stdscr, 1 + i, 0, line, curses.color_pair(kind), w - 1)
         top = 1 + len(rows)
         self._layout(stdscr, top, h - top, w)
         if self.help:
@@ -349,14 +354,17 @@ class App:
         title = f" xtop {snap.host} up {uptime(snap.uptime)} load {load} tasks {snap.nproc}"
         add(stdscr, 0, 0, title.ljust(w - 1), curses.color_pair(8) | curses.A_BOLD)
 
-    def _rows(self, w: int) -> list[str]:
-        content = self._section_lines(w)
-        return [line for group in content for line in group]
+    def _rows(self, w: int) -> list[tuple[str, int]]:
+        tint = {"cpu": 2, "net": 4, "disk": 6, "gpu": 1}
+        rows = []
+        for name, group in self._section_lines(w):
+            rows.extend((line, tint[name]) for line in group)
+        return rows
 
-    def _section_lines(self, w: int) -> list[list[str]]:
+    def _section_lines(self, w: int) -> list[tuple[str, list[str]]]:
         snap = self.snap
         if snap is None or not snap.ready:
-            return [box("host", ["collecting…"], w)]
+            return [("cpu", ["collecting…"])]
         mem = snap.mem
         mem_pct = 100.0 * mem.used / mem.total if mem.total else 0.0
         used_n, used_u = sized(mem.used)
@@ -391,10 +399,10 @@ class App:
                 (value(temp, "C", 4), 0), (value(power, "W", 5), 1),
             ], w))
         return [
-            [host],
-            net_lines or ["none"],
-            disk_lines or ["none"],
-            gpu_lines or ["none"],
+            ("cpu", [host]),
+            ("net", net_lines or ["none"]),
+            ("disk", disk_lines or ["none"]),
+            ("gpu", gpu_lines or ["none"]),
         ]
 
     def _disk_lines(self, width: int) -> list[str]:
