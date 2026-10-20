@@ -161,8 +161,14 @@ def pad(rows: list[list[tuple[str, int]]]) -> list[list[tuple[str, int]]]:
     return padded
 
 
+def box(title: str, lines: list[str], width: int) -> list[str]:
+    """Round-cornered box. Content wider than the box is cut at the right edge."""
+    inner = max(1, width - 2)
+    top = "╭" + title[:inner].center(inner, "─") + "╮"
+    body = ["│" + fit(line, inner).ljust(inner) + "│" for line in lines]
+    bottom = "╰" + "─" * inner + "╯"
+    return [top, *body, bottom]
 def user_name(name: str) -> str:
-    """top's USER column: 8 characters, longer names end with +."""
     if len(name) <= 8:
         return name
     return name[:7] + "+"
@@ -325,9 +331,9 @@ class App:
             stdscr.refresh()
             return
         self._header(stdscr, w)
-        rows = self._device_rows(w)
-        for i, (text, attr) in enumerate(rows):
-            add(stdscr, 1 + i, 0, text, attr, w - 1)
+        rows = self._rows(w)
+        for i, line in enumerate(rows):
+            add(stdscr, 1 + i, 0, line, curses.color_pair(7), w - 1)
         top = 1 + len(rows)
         self._layout(stdscr, top, h - top, w)
         if self.help:
@@ -343,52 +349,56 @@ class App:
         title = f" xtop {snap.host} up {uptime(snap.uptime)} load {load} tasks {snap.nproc}"
         add(stdscr, 0, 0, title.ljust(w - 1), curses.color_pair(8) | curses.A_BOLD)
 
-    def _device_rows(self, w: int) -> list[tuple[str, int]]:
+    def _rows(self, w: int) -> list[str]:
+        content = self._section_lines(w)
+        return [line for group in content for line in group]
+
+    def _section_lines(self, w: int) -> list[list[str]]:
         snap = self.snap
         if snap is None or not snap.ready:
-            return [(" collecting…", curses.color_pair(7))]
-        plain = curses.color_pair(7)
+            return [box("host", ["collecting…"], w)]
         mem = snap.mem
         mem_pct = 100.0 * mem.used / mem.total if mem.total else 0.0
-        specs: list[tuple[list[tuple[str, int]], int]] = []
         used_n, used_u = sized(mem.used)
         total_n, total_u = sized(mem.total)
-        specs.append((
-            [
-                ("CPU", 0), (value(num(snap.cpu.total.busy, 5).strip(), "%", 6), 0),
-                ("MEM", 0), (value(num(mem_pct, 5).strip(), "%", 6), 0),
-                (value(used_n, used_u, 6), 0), ("/", 0), (value(total_n, total_u, 6), 1),
-            ],
-            plain,
-        ))
+        host = columns([
+            ("CPU", 0), (value(num(snap.cpu.total.busy, 5).strip(), "%", 6), 0),
+            ("MEM", 0), (value(num(mem_pct, 5).strip(), "%", 6), 0),
+            (value(used_n, used_u, 6), 0), ("/", 0), (value(total_n, total_u, 6), 1),
+        ], w)
+        net_lines = []
+        for net in snap.nets:
+            rx_n, rx_u = sized(net.rx_bps)
+            tx_n, tx_u = sized(net.tx_bps)
+            net_lines.append(columns([
+                ("NET", 0), (net.name, 0),
+                ("rx", 0), (value(rx_n, rx_u + "/s", 9), 0),
+                ("tx", 0), (value(tx_n, tx_u + "/s", 9), 1),
+            ], w))
+        disk_lines = self._disk_lines(w)
+        gpu_lines = []
         if snap.gpu_error:
-            specs.append(([("GPU", 0), (snap.gpu_error, 1)], curses.color_pair(3)))
+            gpu_lines.append(snap.gpu_error)
         for gpu in snap.gpus:
             used_n, used_u = sized((gpu.mem_used or 0.0) * 1024 * 1024)
             total_n, total_u = sized((gpu.mem_total or 0.0) * 1024 * 1024)
             pct = 100.0 * (gpu.mem_used or 0.0) / gpu.mem_total if gpu.mem_total else 0.0
             temp = f"{gpu.temp:.0f}" if gpu.temp is not None else ""
             power = f"{gpu.power:.0f}" if gpu.power is not None else ""
-            specs.append((
-                [
-                    (f"GPU{gpu.index}", 0), (value(num(gpu.util or 0, 5).strip(), "%", 6), 0),
-                    ("MEM", 0), (value(num(pct, 5).strip(), "%", 6), 0),
-                    (value(used_n, used_u, 6), 0), ("/", 0), (value(total_n, total_u, 6), 0),
-                    (value(temp, "C", 4), 0), (value(power, "W", 5), 1),
-                ],
-                plain,
-            ))
-        for net in snap.nets:
-            rx_n, rx_u = sized(net.rx_bps)
-            tx_n, tx_u = sized(net.tx_bps)
-            specs.append((
-                [
-                    ("NET", 0), (net.name, 0),
-                    ("rx", 0), (value(rx_n, rx_u + "/s", 9), 0),
-                    ("tx", 0), (value(tx_n, tx_u + "/s", 9), 1),
-                ],
-                plain,
-            ))
+            gpu_lines.append(columns([
+                (f"GPU{gpu.index}", 0), (value(num(gpu.util or 0, 5).strip(), "%", 6), 0),
+                (value(used_n, used_u, 6), 0), ("/", 0), (value(total_n, total_u, 6), 0),
+                (value(temp, "C", 4), 0), (value(power, "W", 5), 1),
+            ], w))
+        return [
+            [host],
+            net_lines or ["none"],
+            disk_lines or ["none"],
+            gpu_lines or ["none"],
+        ]
+
+    def _disk_lines(self, width: int) -> list[str]:
+        snap = self.snap
         disks = []
         for disk in snap.disks:
             name = disk.mounts.split(",")[0] if disk.mounts else disk.name
@@ -402,16 +412,17 @@ class App:
                 ("w", 0), (value(write_n, write_u + "/s", 9), 0),
                 (value(free_n, free_u, 6), 0), (value(total_n, total_u, 6), 0),
             ])
-        widest = [0] * len(disks[0]) if disks else []
+        if not disks:
+            return []
+        widest = [0] * len(disks[0])
         for row in disks:
             for i, (text, _) in enumerate(row):
                 widest[i] = max(widest[i], len(text))
-        fixed = sum(widest[i] for i in range(7) if i != 1) + 6
-        mount_w = max(1, (w - 1) - fixed)
+        fixed = sum(widest[i] for i in range(len(disks[0])) if i != 1) + len(disks[0]) - 1
+        mount_w = max(1, width - fixed)
         for row in disks:
             row[1] = (fit(row[1][0], mount_w), 0)
-        specs.extend((row, plain) for row in pad(disks))
-        return [(columns(cells, w - 1), attr) for cells, attr in specs]
+        return [columns(row, width) for row in pad(disks)]
 
     def _layout(self, stdscr: curses.window, top: int, height: int, width: int) -> None:
         rows = PRESETS[self.preset]
