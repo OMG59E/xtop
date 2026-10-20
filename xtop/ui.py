@@ -161,7 +161,11 @@ def pad(rows: list[list[tuple[str, int]]]) -> list[list[tuple[str, int]]]:
     return padded
 
 
-def cell(text: str, width: int) -> str:
+def user_name(name: str) -> str:
+    """top's USER column: 8 characters, longer names end with +."""
+    if len(name) <= 8:
+        return name
+    return name[:7] + "+"
     return fit(text, width).ljust(width)
 
 
@@ -525,14 +529,14 @@ class App:
             self.proc_offset = max(0, len(procs) - visible)
         shown = procs[self.proc_offset : self.proc_offset + visible]
         table = [[
-            ("PID", 2), ("USER", 0), ("CPU", 2), ("MEM", 2), ("RSS", 2), ("CMD", 1),
+            ("PID", 2), (user_name("USER"), 0), ("%CPU", 2), ("%MEM", 2), ("RSS", 2), ("CMD", 1),
         ]]
         for proc in shown:
             rss_n, rss_u = sized(proc.rss)
             table.append([
-                (str(proc.pid), 2), (proc.user, 0),
-                (value(f"{proc.cpu:.1f}", "%", 6), 2),
-                (value(f"{proc.mem:.1f}", "%", 6), 2),
+                (str(proc.pid), 2), (user_name(proc.user), 0),
+                (f"{proc.cpu:5.1f}", 2),
+                (f"{proc.mem:5.1f}", 2),
                 (value(rss_n, rss_u, 6), 2),
                 (proc.cmd, 1),
             ])
@@ -575,7 +579,7 @@ class App:
 def main(argv: list[str] | None = None) -> int:
     locale.setlocale(locale.LC_ALL, "")
     parser = argparse.ArgumentParser(prog="xtop", description="small resource monitor")
-    parser.add_argument("-d", "--delay", type=float, default=5.0, help="sample interval seconds")
+    parser.add_argument("-d", "--delay", type=float, default=2.0, help="sample interval seconds")
     parser.add_argument("-l", "--layout", default=PRESET_ORDER[0], choices=list(PRESETS), help="layout preset")
     parser.add_argument("-v", "--version", action="version", version=__version__)
     args = parser.parse_args(argv)

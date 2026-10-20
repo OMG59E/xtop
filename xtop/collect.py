@@ -774,8 +774,9 @@ class Collector:
                         free=usage.get(name, (0, 0))[1],
                     )
                 )
+        rows = [d for d in rows if d.mounts]
         self.prev_disk = cur
-        rows.sort(key=lambda d: d.read_bps + d.write_bps, reverse=True)
+        rows.sort(key=lambda d: _block_devices().index(d.name) if d.name in _block_devices() else 0)
         return rows
 
     def _nets(self, dt: float | None) -> list[NetStat]:
