@@ -24,6 +24,7 @@ SUMMARY_SEPARATOR = " │ "
 WIDE_SUMMARY_MIN_WIDTH = (
     SUMMARY_LEFT_WIDTH + len(SUMMARY_SEPARATOR) + GPU_PANEL_MIN_WIDTH + 1
 )
+PROC_HEADER_PAIR = 1
 
 
 def htop_mem(n: float) -> str:
@@ -250,7 +251,7 @@ def add(win: curses.window, y: int, x: int, text: str, attr: int = 0, width: int
 
 
 class App:
-    def __init__(self, interval: float, preset: str, refresh: float = 0.25) -> None:
+    def __init__(self, interval: float, preset: str, refresh: float = 3.0) -> None:
         self.interval = interval
         self.refresh_interval = refresh
         self.monitor = Monitor(interval)
@@ -260,11 +261,14 @@ class App:
         self.paused = False
         self.snap: Snapshot | None = None
         self.help = False
+        self.proc_header_attr = curses.A_REVERSE
+        self.refresh_pending = False
 
     def run(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
         # Pair 0 follows the terminal's own foreground/background defaults.
         curses.use_default_colors()
+        self._init_styles()
         stdscr.nodelay(True)
         stdscr.keypad(True)
         self.monitor.start()
@@ -273,11 +277,24 @@ class App:
                 if not self.paused:
                     self.snap = self.monitor.snapshot()
                 self.draw(stdscr)
-                key = self._wait_key(stdscr, self.refresh_interval)
+                timeout = 0.1 if self.refresh_pending else self.refresh_interval
+                self.refresh_pending = False
+                key = self._wait_key(stdscr, timeout)
                 if key is not None and not self._handle(key):
                     return
         finally:
             self.monitor.close()
+
+    def _init_styles(self) -> None:
+        """Use a top-like process header, with reverse video as fallback."""
+        self.proc_header_attr = curses.A_REVERSE
+        if not curses.has_colors():
+            return
+        try:
+            curses.init_pair(PROC_HEADER_PAIR, curses.COLOR_BLACK, curses.COLOR_WHITE)
+            self.proc_header_attr = curses.color_pair(PROC_HEADER_PAIR)
+        except curses.error:
+            pass
 
     def _wait_key(self, stdscr: curses.window, timeout: float) -> int | None:
         stdscr.timeout(max(1, int(timeout * 1000)))
@@ -308,6 +325,7 @@ class App:
             self.proc_offset = 0
         elif key == ord("r"):
             self.monitor.refresh()
+            self.refresh_pending = True
         elif key == curses.KEY_DOWN:
             self.proc_offset += 1
         elif key == curses.KEY_UP:
@@ -588,7 +606,7 @@ class App:
             ])
         table = pad(table)
         lines = layout(table, width - 1, ellipsis=False)
-        add(win, 0, 0, lines[0], curses.A_BOLD)
+        add(win, 0, 0, lines[0].ljust(width - 1), self.proc_header_attr, width - 1)
         for i, line in enumerate(lines[1:]):
             add(win, 1 + i, 0, line)
 
@@ -626,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     locale.setlocale(locale.LC_ALL, "")
     parser = argparse.ArgumentParser(prog="xtop", description="small resource monitor")
     parser.add_argument("-d", "--delay", type=float, default=1.0, help="host sample interval seconds")
-    parser.add_argument("--refresh", type=float, default=0.25, help="screen refresh interval seconds")
+    parser.add_argument("--refresh", type=float, default=3.0, help="screen refresh interval seconds")
     parser.add_argument("-l", "--layout", default=PRESET_ORDER[0], choices=list(PRESETS), help="layout preset")
     parser.add_argument("-v", "--version", action="version", version=__version__)
     args = parser.parse_args(argv)
