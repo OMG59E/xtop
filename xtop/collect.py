@@ -90,6 +90,15 @@ class GpuStat:
 
 
 @dataclass
+class IpuStat:
+    index: int
+    util: float | None
+    mem_used: int
+    mem_total: int
+    power: float | None
+
+
+@dataclass
 class DiskStat:
     name: str
     read_bps: float
@@ -151,6 +160,8 @@ class Snapshot:
     disk_hist: list[float]
     ready: bool
     errors: dict[str, str] = field(default_factory=dict)
+    ipus: list[IpuStat] = field(default_factory=list)
+    ipu_error: str = ""
 
 
 def _read(path: str) -> str:
@@ -392,7 +403,7 @@ def _dm_chain(dm: str, disk: str, parent: dict[str, str]) -> None:
         _dm_chain(holder, disk, parent)
 
 
-def _ipv4_ifaces() -> set[str]:
+def _ipv4_ifaces() -> dict[str, str]:
     """Non-loopback interfaces that have an IPv4 address. SIOCGIFCONF, stdlib only."""
     import ctypes
     import ctypes.util
@@ -406,12 +417,12 @@ def _ipv4_ifaces() -> set[str]:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     except OSError:
-        return set()
+        return {}
     try:
         if libc.ioctl(sock.fileno(), 0x8912, arr) < 0:  # SIOCGIFCONF
-            return set()
+            return {}
         length = struct.unpack_from("i", arr.raw)[0]
-        found: set[str] = set()
+        found: dict[str, str] = {}
         offset = 0
         while offset + 40 <= length:
             name = buf.raw[offset : offset + 16].split(b"\x00", 1)[0].decode()
@@ -419,7 +430,7 @@ def _ipv4_ifaces() -> set[str]:
             if family == socket.AF_INET:
                 ip = socket.inet_ntoa(buf.raw[offset + 20 : offset + 24])
                 if not ip.startswith("127."):
-                    found.add(name)
+                    found.setdefault(name, ip)
             offset += 40
         return found
     finally:
@@ -451,9 +462,9 @@ def _diskstats() -> dict[str, tuple[int, int, int]]:
     return out
 
 
-def _netdev() -> dict[str, tuple[int, int]]:
+def _netdev() -> dict[str, tuple[int, int, str]]:
     wanted = _ipv4_ifaces()
-    out: dict[str, tuple[int, int]] = {}
+    out: dict[str, tuple[int, int, str]] = {}
     try:
         lines = _read("/proc/net/dev").splitlines()[2:]
     except OSError:
@@ -469,7 +480,7 @@ def _netdev() -> dict[str, tuple[int, int]]:
         if len(cols) < 9:
             continue
         try:
-            out[name] = (int(cols[0]), int(cols[8]))
+            out[name] = (int(cols[0]), int(cols[8]), wanted[name])
         except ValueError:
             continue
     return out
@@ -772,13 +783,13 @@ class Collector:
         cur = _netdev()
         rows: list[NetStat] = []
         if dt is not None:
-            for name, (rx, tx) in cur.items():
+            for name, (rx, tx, ip) in cur.items():
                 prev = self.prev_net.get(name)
                 if prev is None:
                     continue
                 rows.append(
                     NetStat(
-                        name=name,
+                        name=ip,
                         rx_bps=max(0.0, (rx - prev[0]) / dt),
                         tx_bps=max(0.0, (tx - prev[1]) / dt),
                     )

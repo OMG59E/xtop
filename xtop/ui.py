@@ -15,7 +15,7 @@ from .monitor import Monitor
 
 PANELS = ("cpu", "mem", "gpu", "disk", "net", "fs", "proc")
 SORTS = ("cpu", "mem", "pid")
-SUMMARY_NET_WIDTH = 12
+SUMMARY_NET_WIDTH = 16
 SUMMARY_MOUNT_WIDTH = 16
 SUMMARY_GPU_WIDTH = 5
 SUMMARY_LEFT_WIDTH = 60
@@ -137,6 +137,12 @@ def sized(n: float) -> tuple[str, str]:
         i += 1
     number = f"{value:.0f}" if i == 0 or value >= 100 else f"{value:.1f}"
     return number, units[i]
+
+
+def mem_pair(used: str, used_unit: str, total: str, total_unit: str) -> str:
+    """Used and total share the widest number, so the slash stays put."""
+    width = max(5, len(used), len(total))
+    return f"{used.rjust(width)}{used_unit} / {total.rjust(width)}{total_unit}"
 
 
 def value(number: str, unit: str, width: int) -> str:
@@ -396,19 +402,22 @@ class App:
         used_n, used_u = sized(mem.used)
         total_n, total_u = sized(mem.total)
         host = (
-            f"CPU {value(num(snap.cpu.total.busy, 5).strip(), '%', 6)} "
+            f"CPU {value(num(snap.cpu.total.busy, 5).strip(), '%', 6)} | "
             f"MEM {value(num(mem_pct, 5).strip(), '%', 6)} "
-            f"{value(used_n, used_u, 6)}/{value(total_n, total_u, 6)}"
+            f"{value(used_n, used_u + ' / ', 10)}{total_n}{total_u}"
         )
         net_lines = []
         for net in snap.nets:
             rx_n, rx_u = sized(net.rx_bps)
             tx_n, tx_u = sized(net.tx_bps)
             net_lines.append(
-                f"NET {fixed(net.name, SUMMARY_NET_WIDTH)} rx {value(rx_n, rx_u + '/s', 9)} "
-                f"tx {value(tx_n, tx_u + '/s', 9)}"
+                f"NET {fixed(net.name, SUMMARY_NET_WIDTH)} ↑ {value(rx_n, rx_u + '/s', 9)} "
+                f"↓ {value(tx_n, tx_u + '/s', 9)}"
             )
         disk_lines = self._disk_lines()
+        ipu_lines = self._ipu_lines()
+        if snap.ipu_error:
+            ipu_lines.insert(0, snap.ipu_error)
         gpu_lines = self._gpu_summary_lines()
         if snap.gpu_error:
             gpu_lines.insert(0, snap.gpu_error)
@@ -416,8 +425,26 @@ class App:
             ("cpu", [host]),
             ("net", net_lines or ["NET none"]),
             ("disk", disk_lines or ["DSK none"]),
+            ("ipu", ipu_lines),
             ("gpu", gpu_lines or ["GPU none"]),
         ]
+
+    def _ipu_lines(self) -> list[str]:
+        snap = self.snap
+        if snap is None:
+            return []
+        lines = []
+        for ipu in snap.ipus:
+            used_n, total_n = f"{ipu.mem_used:.0f}", f"{ipu.mem_total:.0f}"
+            util = "" if ipu.util is None else num(ipu.util, 5).strip()
+            power = "" if ipu.power is None else f"{ipu.power:.1f}"
+            lines.append(
+                f"{fixed(f'IPU{ipu.index}', SUMMARY_GPU_WIDTH)} "
+                f"{value(util, '%', 6)} "
+                f"{mem_pair(used_n, 'M', total_n, 'M')} "
+                f"{value(power, 'W', 6)}"
+            )
+        return lines
 
     def _gpu_summary_lines(self) -> list[str]:
         snap = self.snap
@@ -425,14 +452,14 @@ class App:
             return []
         lines = []
         for gpu in snap.gpus:
-            used_n, used_u = sized((gpu.mem_used or 0.0) * 1024 * 1024)
-            total_n, total_u = sized((gpu.mem_total or 0.0) * 1024 * 1024)
+            used_n = f"{gpu.mem_used or 0.0:.0f}"
+            total_n = f"{gpu.mem_total or 0.0:.0f}"
             temp = f"{gpu.temp:.0f}" if gpu.temp is not None else ""
             power = f"{gpu.power:.0f}" if gpu.power is not None else ""
             lines.append(
                 f"{fixed(f'GPU{gpu.index}', SUMMARY_GPU_WIDTH)} "
                 f"{value(num(gpu.util or 0, 5).strip(), '%', 6)} "
-                f"{value(used_n, used_u, 6)}/{value(total_n, total_u, 6)} "
+                f"{mem_pair(used_n, 'M', total_n, 'M')} "
                 f"{value(temp, 'C', 4)} {value(power, 'W', 5)}"
             )
         return lines
@@ -624,7 +651,7 @@ class App:
             "s         进程排序 cpu / mem / pid",
             "space     暂停",
             "r         立刻刷新",
-            "↑ ↓       滚动进程",
+            "↑ ⬇️       滚动进程",
             "?         关闭帮助",
         ]
         bh, bw = len(lines) + 2, 46

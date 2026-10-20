@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 
 from .collect import Collector, CpuStat, MemStat, Snapshot, _mounts
 from .gpu import make_gpu_provider
+from .ipu import make_ipu_provider
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,8 @@ class _State:
     gpu_error: str = ""
     gpu_attempt: float = 0.0
     gpu_updated: float = 0.0
+    ipus: list = field(default_factory=list)
+    ipu_error: str = ""
     errors: dict[str, str] = field(default_factory=dict)
     system_samples: int = 0
 
@@ -47,12 +50,14 @@ class Monitor:
         self.intervals = PollIntervals(system=base, io=base, process=base)
         self.collector = Collector()
         self.gpu = gpu_provider if gpu_provider is not None else make_gpu_provider()
+        self.ipu = make_ipu_provider()
         self.state = _State()
         self._snapshot: Snapshot | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._gpu_wake = threading.Event()
+        self._ipu_wake = threading.Event()
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
@@ -61,6 +66,7 @@ class Monitor:
         self._threads = [
             threading.Thread(target=self._host_loop, name="xtop-host", daemon=True),
             threading.Thread(target=self._gpu_loop, name="xtop-gpu", daemon=True),
+            threading.Thread(target=self._ipu_loop, name="xtop-ipu", daemon=True),
         ]
         for thread in self._threads:
             thread.start()
@@ -69,6 +75,7 @@ class Monitor:
         self._stop.set()
         self._wake.set()
         self._gpu_wake.set()
+        self._ipu_wake.set()
         for thread in self._threads:
             thread.join(timeout=3.0)
         # Never shut NVML down underneath a driver call that did not return.
@@ -77,11 +84,17 @@ class Monitor:
                 self.gpu.close()
             except Exception:
                 pass
+            if self.ipu is not None:
+                try:
+                    self.ipu.close()
+                except Exception:
+                    pass
         self._threads = []
 
     def refresh(self) -> None:
         self._wake.set()
         self._gpu_wake.set()
+        self._ipu_wake.set()
 
     def snapshot(self) -> Snapshot | None:
         with self._lock:
@@ -109,6 +122,8 @@ class Monitor:
             gpu_error=state.gpu_error,
             disks=state.disks,
             nets=state.nets,
+            ipus=state.ipus,
+            ipu_error=state.ipu_error,
             mounts=state.mounts,
             procs=state.procs,
             nproc=state.nproc,
@@ -246,4 +261,31 @@ class Monitor:
                         self.state.gpu_error = error
                     self._publish_locked()
                 process_due = now + self._delay(self.gpu.process_interval, process_failures)
+            self._stop.wait(0.1)
+
+    def _ipu_loop(self) -> None:
+        if self.ipu is None:
+            return
+        due = 0.0
+        failures = 0
+        while not self._stop.is_set():
+            if self._ipu_wake.is_set():
+                self._ipu_wake.clear()
+                due = 0.0
+            now = time.monotonic()
+            if now >= due:
+                try:
+                    rows, error = self.ipu.metrics()
+                except Exception as exc:
+                    rows, error = [], str(exc)
+                if error:
+                    failures += 1
+                else:
+                    failures = 0
+                with self._lock:
+                    if not error:
+                        self.state.ipus = rows
+                    self.state.ipu_error = error
+                    self._publish_locked()
+                due = now + self._delay(self.ipu.interval, failures)
             self._stop.wait(0.1)

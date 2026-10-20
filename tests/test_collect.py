@@ -98,7 +98,7 @@ class LayoutTest(unittest.TestCase):
             ready=True,
             mem=SimpleNamespace(used=1024, total=8192),
             cpu=SimpleNamespace(total=SimpleNamespace(busy=25)),
-            nets=[], disks=[], gpus=[gpu], gpu_error="",
+            nets=[], disks=[], gpus=[gpu], gpu_error="", ipus=[], ipu_error="",
         )
 
         narrow = app._rows(111, 24)
