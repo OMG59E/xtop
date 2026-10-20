@@ -18,6 +18,12 @@ SORTS = ("cpu", "mem", "pid")
 SUMMARY_NET_WIDTH = 12
 SUMMARY_MOUNT_WIDTH = 16
 SUMMARY_GPU_WIDTH = 5
+SUMMARY_LEFT_WIDTH = 60
+GPU_PANEL_MIN_WIDTH = 48
+SUMMARY_SEPARATOR = " │ "
+WIDE_SUMMARY_MIN_WIDTH = (
+    SUMMARY_LEFT_WIDTH + len(SUMMARY_SEPARATOR) + GPU_PANEL_MIN_WIDTH + 1
+)
 
 
 def htop_mem(n: float) -> str:
@@ -322,7 +328,7 @@ class App:
             stdscr.refresh()
             return
         self._header(stdscr, w)
-        rows = self._rows()
+        rows = self._rows(w, h)
         for i, line in enumerate(rows):
             add(stdscr, 1 + i, 0, line, width=w - 1)
         top = 1 + len(rows)
@@ -342,8 +348,26 @@ class App:
             title += " !" + ",".join(sorted(snap.errors))
         add(stdscr, 0, 0, title.ljust(w - 1), curses.A_BOLD)
 
-    def _rows(self) -> list[str]:
-        return [line for _, group in self._section_lines() for line in group]
+    def _rows(self, width: int, height: int) -> list[str]:
+        sections = self._section_lines()
+        snap = self.snap
+        if not snap or not snap.ready or not snap.gpus or width < WIDE_SUMMARY_MIN_WIDTH:
+            return [line for _, group in sections for line in group]
+
+        left = [line for name, group in sections if name != "gpu" for line in group]
+        max_gpu_rows = max(4, min(10, height // 3))
+        right = self._gpu_panel_lines(max_gpu_rows)
+        right_width = width - SUMMARY_LEFT_WIDTH - len(SUMMARY_SEPARATOR) - 1
+        rows = []
+        for index in range(max(len(left), len(right))):
+            left_line = left[index] if index < len(left) else ""
+            right_line = right[index] if index < len(right) else ""
+            rows.append(
+                fixed(left_line, SUMMARY_LEFT_WIDTH)
+                + SUMMARY_SEPARATOR
+                + right_line[:right_width]
+            )
+        return rows
 
     def _section_lines(self) -> list[tuple[str, list[str]]]:
         snap = self.snap
@@ -367,26 +391,68 @@ class App:
                 f"tx {value(tx_n, tx_u + '/s', 9)}"
             )
         disk_lines = self._disk_lines()
-        gpu_lines = []
+        gpu_lines = self._gpu_summary_lines()
         if snap.gpu_error:
-            gpu_lines.append(snap.gpu_error)
+            gpu_lines.insert(0, snap.gpu_error)
+        return [
+            ("cpu", [host]),
+            ("net", net_lines or ["NET none"]),
+            ("disk", disk_lines or ["DSK none"]),
+            ("gpu", gpu_lines or ["GPU none"]),
+        ]
+
+    def _gpu_summary_lines(self) -> list[str]:
+        snap = self.snap
+        if snap is None:
+            return []
+        lines = []
         for gpu in snap.gpus:
             used_n, used_u = sized((gpu.mem_used or 0.0) * 1024 * 1024)
             total_n, total_u = sized((gpu.mem_total or 0.0) * 1024 * 1024)
             temp = f"{gpu.temp:.0f}" if gpu.temp is not None else ""
             power = f"{gpu.power:.0f}" if gpu.power is not None else ""
-            gpu_lines.append(
+            lines.append(
                 f"{fixed(f'GPU{gpu.index}', SUMMARY_GPU_WIDTH)} "
                 f"{value(num(gpu.util or 0, 5).strip(), '%', 6)} "
                 f"{value(used_n, used_u, 6)}/{value(total_n, total_u, 6)} "
                 f"{value(temp, 'C', 4)} {value(power, 'W', 5)}"
             )
-        return [
-            ("cpu", [host]),
-            ("net", net_lines or ["none"]),
-            ("disk", disk_lines or ["none"]),
-            ("gpu", gpu_lines or ["none"]),
-        ]
+        return lines
+
+    def _gpu_panel_lines(self, max_rows: int) -> list[str]:
+        snap = self.snap
+        if snap is None:
+            return []
+        lines = self._gpu_summary_lines()
+        if snap.gpu_error:
+            lines.insert(0, snap.gpu_error)
+
+        processes = [proc for gpu in snap.gpus for proc in gpu.procs]
+        processes.sort(key=lambda proc: (proc.gpu, -(proc.mem_mib or 0), proc.pid))
+        if not processes:
+            if len(lines) < max_rows:
+                lines.append("no GPU processes")
+            return lines
+
+        if len(lines) >= max_rows:
+            return lines
+        header = f"{'GPU':>3} {'PID':>7} {'USER':<8} {'MEM':>7} COMMAND"
+        lines.append(header)
+        room = max(0, max_rows - len(lines))
+        shown = len(processes) if len(processes) <= room else max(0, room - 1)
+        for proc in processes[:shown]:
+            if proc.mem_mib is None:
+                mem = value("-", "", 7)
+            else:
+                mem_n, mem_u = sized(proc.mem_mib * 1024 * 1024)
+                mem = value(mem_n, mem_u, 7)
+            lines.append(
+                f"{proc.gpu:>3} {proc.pid:>7} {fixed(proc.user, 8)} {mem} {proc.cmd}"
+            )
+        hidden = len(processes) - shown
+        if hidden > 0 and room > 0:
+            lines.append(f"+{hidden} more")
+        return lines
 
     def _disk_lines(self) -> list[str]:
         snap = self.snap

@@ -2,11 +2,12 @@
 
 import time
 import unittest
+from types import SimpleNamespace
 
 from xtop.collect import Collector, CpuMeter, GpuStat, _cpu_meter, _parse_stat_line
 from xtop.layout import PRESETS, PRESET_ORDER
 from xtop.monitor import Monitor
-from xtop.ui import columns, compact, fixed, htop_mem, human, layout, pad, rate, spark
+from xtop.ui import App, columns, compact, fixed, htop_mem, human, layout, pad, rate, spark
 
 
 class FormatTest(unittest.TestCase):
@@ -83,6 +84,33 @@ class LayoutTest(unittest.TestCase):
                 for panel, weight in cells:
                     self.assertIn(panel, {"cpu", "mem", "gpu", "disk", "net", "fs", "proc"})
                     self.assertGreater(weight, 0)
+
+    def test_wide_summary_puts_gpu_processes_on_the_right(self):
+        gpu_proc = SimpleNamespace(
+            gpu=0, pid=1234, user="alice", mem_mib=512, cmd="python train.py"
+        )
+        gpu = SimpleNamespace(
+            index=0, util=75, mem_used=1024, mem_total=8192,
+            temp=55, power=120, procs=[gpu_proc],
+        )
+        app = App.__new__(App)
+        app.snap = SimpleNamespace(
+            ready=True,
+            mem=SimpleNamespace(used=1024, total=8192),
+            cpu=SimpleNamespace(total=SimpleNamespace(busy=25)),
+            nets=[], disks=[], gpus=[gpu], gpu_error="",
+        )
+
+        narrow = app._rows(111, 24)
+        edge = app._rows(112, 24)
+        wide = app._rows(120, 24)
+
+        self.assertFalse(any(" │ " in line for line in narrow))
+        self.assertTrue(any(" │ " in line for line in edge))
+        self.assertTrue(any(" │ " in line for line in wide))
+        self.assertTrue(any("GPU0" in line for line in wide))
+        self.assertTrue(any("COMMAND" in line for line in wide))
+        self.assertTrue(any("python train.py" in line for line in wide))
 
 
 class CollectorTest(unittest.TestCase):
