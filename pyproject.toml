@@ -6,7 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "xtop"
 version = "0.1.0"
 description = "Compact terminal resource monitor"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+gpu = ["nvidia-ml-py"]
 
 [project.scripts]
 xtop = "xtop.ui:main"

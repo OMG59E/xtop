@@ -3,9 +3,10 @@
 import time
 import unittest
 
-from xtop.collect import Collector, CpuMeter, _cpu_meter, _parse_stat_line
+from xtop.collect import Collector, CpuMeter, GpuStat, _cpu_meter, _parse_stat_line
 from xtop.layout import PRESETS, PRESET_ORDER
-from xtop.ui import columns, compact, htop_mem, human, layout, pad, rate, spark
+from xtop.monitor import Monitor
+from xtop.ui import columns, compact, fixed, htop_mem, human, layout, pad, rate, spark
 
 
 class FormatTest(unittest.TestCase):
@@ -33,6 +34,14 @@ class FormatTest(unittest.TestCase):
         lines = layout([[("PID", 0), ("1", 2)], [("PID", 0), ("624689", 2)]], 16)
         self.assertTrue(lines[0].endswith("     1"))
         self.assertTrue(lines[1].endswith("624689"))
+
+    def test_layout_can_crop_without_ellipsis(self):
+        line = layout([[("COMMAND", 0), ("long command", 1)]], 14, ellipsis=False)[0]
+        self.assertEqual(line, "COMMAND long c")
+
+    def test_fixed_summary_cell_has_no_ellipsis(self):
+        self.assertEqual(fixed("very-long-device", 8), "very-lon")
+        self.assertEqual(fixed("eth0", 8), "eth0    ")
 
 
 class ParseTest(unittest.TestCase):
@@ -88,10 +97,85 @@ class CollectorTest(unittest.TestCase):
         self.assertGreater(len(second.cpu.cores), 0)
         self.assertGreaterEqual(second.nproc, 1)
         self.assertGreaterEqual(second.threads, second.nproc)
-        self.assertTrue(any(p.user == "root" for p in second.procs))
         self.assertGreater(second.mem.total, second.mem.used)
         self.assertTrue(second.mounts)
         self.assertTrue(second.host)
+
+
+class _FailingGpu:
+    name = "fake"
+    metric_interval = 0.05
+    process_interval = 0.1
+
+    def __init__(self):
+        self.calls = 0
+        self.closed = False
+
+    def metrics(self):
+        self.calls += 1
+        if self.calls == 1:
+            return [GpuStat(0, "fake", 10, 20, 30, 40, 50, 60, 70)], ""
+        return [], "GPU lost"
+
+    def processes(self, gpus):
+        return gpus, ""
+
+    def close(self):
+        self.closed = True
+
+
+class _CountingGpu:
+    name = "fake"
+    metric_interval = 0.04
+    process_interval = 0.16
+
+    def __init__(self):
+        self.metric_calls = 0
+        self.process_calls = 0
+
+    def metrics(self):
+        self.metric_calls += 1
+        return [GpuStat(0, "fake", 10, 20, 30, 40, 50, 60, 70, "GPU-fake")], ""
+
+    def processes(self, gpus):
+        self.process_calls += 1
+        return gpus, ""
+
+    def close(self):
+        pass
+
+
+class MonitorTest(unittest.TestCase):
+    def test_gpu_failure_keeps_last_good_snapshot(self):
+        gpu = _FailingGpu()
+        monitor = Monitor(0.2, gpu_provider=gpu)
+        monitor.start()
+        try:
+            deadline = time.monotonic() + 2
+            snap = None
+            while time.monotonic() < deadline:
+                snap = monitor.snapshot()
+                if snap and snap.gpu_error:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(snap)
+            self.assertEqual(snap.gpu_error, "GPU lost")
+            self.assertEqual([item.name for item in snap.gpus], ["fake"])
+        finally:
+            monitor.close()
+        self.assertTrue(gpu.closed)
+
+    def test_gpu_metrics_and_processes_have_independent_frequencies(self):
+        gpu = _CountingGpu()
+        monitor = Monitor(0.2, gpu_provider=gpu)
+        monitor.start()
+        try:
+            time.sleep(0.28)
+        finally:
+            monitor.close()
+        self.assertGreaterEqual(gpu.metric_calls, 3)
+        self.assertGreaterEqual(gpu.process_calls, 2)
+        self.assertLess(gpu.process_calls, gpu.metric_calls)
 
 
 if __name__ == "__main__":

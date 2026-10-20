@@ -7,14 +7,17 @@ import curses
 import locale
 import os
 import sys
-import time
 
 from . import __version__
-from .collect import Collector, Snapshot
+from .collect import Snapshot
 from .layout import PRESET_ORDER, PRESETS
+from .monitor import Monitor
 
 PANELS = ("cpu", "mem", "gpu", "disk", "net", "fs", "proc")
 SORTS = ("cpu", "mem", "pid")
+SUMMARY_NET_WIDTH = 12
+SUMMARY_MOUNT_WIDTH = 16
+SUMMARY_GPU_WIDTH = 5
 
 
 def htop_mem(n: float) -> str:
@@ -51,7 +54,7 @@ def pct(n: float | None) -> str:
 
 
 def meter(segments: list[tuple[float, int]], width: int) -> list[tuple[str, int]]:
-    """htop bar: each (ratio, color_pair) becomes that many colored blocks."""
+    """Build a text meter from (ratio, terminal attribute) segments."""
     width = max(1, width)
     total = sum(max(0.0, ratio) for ratio, _ in segments)
     scale = min(1.0, total)
@@ -107,12 +110,12 @@ def uptime(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def fit(text: str, width: int) -> str:
+def fit(text: str, width: int, ellipsis: bool = True) -> str:
     if width <= 0:
         return ""
     if len(text) <= width:
         return text
-    if width <= 1:
+    if not ellipsis or width <= 1:
         return text[:width]
     return text[: width - 1] + "…"
 
@@ -133,6 +136,13 @@ def value(number: str, unit: str, width: int) -> str:
     """Fixed-width number with its unit glued on. The number is padded, never the unit."""
     gap = width - len(unit)
     return number.rjust(gap) + unit
+
+
+def fixed(text: str, width: int) -> str:
+    """A fixed-width summary cell, cropped without an ellipsis."""
+    return text[:width].ljust(width)
+
+
 def compact(n: float) -> str:
     number, unit = sized(n)
     return number + unit
@@ -168,11 +178,12 @@ def box(title: str, lines: list[str], width: int) -> list[str]:
     body = ["│" + fit(line, inner).ljust(inner) + "│" for line in lines]
     bottom = "╰" + "─" * inner + "╯"
     return [top, *body, bottom]
+
+
 def user_name(name: str) -> str:
     if len(name) <= 8:
         return name
     return name[:7] + "+"
-    return fit(text, width).ljust(width)
 
 
 def columns(cells: list[tuple[str, int]], width: int, gap: int = 1) -> str:
@@ -180,7 +191,12 @@ def columns(cells: list[tuple[str, int]], width: int, gap: int = 1) -> str:
     return layout([cells], width, gap)[0]
 
 
-def layout(rows: list[list[tuple[str, int]]], width: int, gap: int = 1) -> list[str]:
+def layout(
+    rows: list[list[tuple[str, int]]],
+    width: int,
+    gap: int = 1,
+    ellipsis: bool = True,
+) -> list[str]:
     """Format rows together so a right-aligned column shares one width."""
     if not rows:
         return []
@@ -192,37 +208,24 @@ def layout(rows: list[list[tuple[str, int]]], width: int, gap: int = 1) -> list[
             col_w[i] = max(col_w[i], len(text))
             grow_of[i] = max(grow_of[i], grow)
     gaps = gap * (count - 1)
-    spare = width - gaps - sum(1 if grow_of[i] == 1 else col_w[i] for i in range(count))
     flex = [i for i in range(count) if grow_of[i] == 1]
-    if spare < 0 and flex:
-        for i in flex:
-            if spare >= 0:
-                break
-            cut = min(col_w[i] - 1, -spare)
-            col_w[i] -= max(0, cut)
-            spare += max(0, cut)
-        spare = max(0, spare)
-    if flex and spare > 0:
-        share, rest = divmod(spare, len(flex))
+    if flex:
+        # Flexible columns own exactly the space left by fixed columns. Their
+        # natural text width must not be counted twice when distributing it.
+        fixed = sum(col_w[i] for i in range(count) if i not in flex)
+        available = max(len(flex), width - gaps - fixed)
+        share, rest = divmod(available, len(flex))
         for n, i in enumerate(flex):
-            col_w[i] += share + (1 if n < rest else 0)
+            col_w[i] = share + (1 if n < rest else 0)
     lines = []
     for row in rows:
         parts = []
         for i in range(len(row)):
             text, grow = row[i]
-            shown = fit(text, col_w[i])
+            shown = fit(text, col_w[i], ellipsis)
             parts.append(shown.rjust(col_w[i]) if grow == 2 else shown.ljust(col_w[i]))
         lines.append((gap * " ").join(parts)[:width])
     return lines
-
-
-def level_attr(ratio: float) -> int:
-    if ratio >= 0.90:
-        return curses.color_pair(3) | curses.A_BOLD
-    if ratio >= 0.70:
-        return curses.color_pair(2)
-    return curses.color_pair(1)
 
 
 def add(win: curses.window, y: int, x: int, text: str, attr: int = 0, width: int | None = None) -> None:
@@ -241,9 +244,10 @@ def add(win: curses.window, y: int, x: int, text: str, attr: int = 0, width: int
 
 
 class App:
-    def __init__(self, interval: float, preset: str) -> None:
+    def __init__(self, interval: float, preset: str, refresh: float = 0.25) -> None:
         self.interval = interval
-        self.collector = Collector()
+        self.refresh_interval = refresh
+        self.monitor = Monitor(interval)
         self.preset = preset if preset in PRESETS else PRESET_ORDER[0]
         self.sort = "cpu"
         self.proc_offset = 0
@@ -253,39 +257,21 @@ class App:
 
     def run(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
+        # Pair 0 follows the terminal's own foreground/background defaults.
         curses.use_default_colors()
         stdscr.nodelay(True)
         stdscr.keypad(True)
-        self._colors()
-        next_sample = 0.0
-        while True:
-            now = time.monotonic()
-            if not self.paused and now >= next_sample:
-                self.snap = self.collector.sample()
-                next_sample = now + self.interval
-            self.draw(stdscr)
-            key = self._wait_key(stdscr, max(0.05, next_sample - time.monotonic()))
-            if key is None:
-                continue
-            if not self._handle(key):
-                return
-
-    def _colors(self) -> None:
-        curses.start_color()
-        curses.use_default_colors()
-        if curses.COLORS >= 256:
-            dim = {1: 65, 2: 137, 4: 66, 5: 103, 6: 132}  # green, gold, teal, steel, plum
-            for pair, color in dim.items():
-                curses.init_pair(pair, color, -1)
-        else:
-            curses.init_pair(1, curses.COLOR_GREEN, -1)
-            curses.init_pair(2, curses.COLOR_YELLOW, -1)
-            curses.init_pair(4, curses.COLOR_CYAN, -1)
-            curses.init_pair(5, curses.COLOR_BLUE, -1)
-            curses.init_pair(6, curses.COLOR_MAGENTA, -1)
-        curses.init_pair(3, curses.COLOR_RED, -1)
-        curses.init_pair(7, curses.COLOR_WHITE, -1)
-        curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        self.monitor.start()
+        try:
+            while True:
+                if not self.paused:
+                    self.snap = self.monitor.snapshot()
+                self.draw(stdscr)
+                key = self._wait_key(stdscr, self.refresh_interval)
+                if key is not None and not self._handle(key):
+                    return
+        finally:
+            self.monitor.close()
 
     def _wait_key(self, stdscr: curses.window, timeout: float) -> int | None:
         stdscr.timeout(max(1, int(timeout * 1000)))
@@ -315,7 +301,7 @@ class App:
             self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
             self.proc_offset = 0
         elif key == ord("r"):
-            self.snap = self.collector.sample()
+            self.monitor.refresh()
         elif key == curses.KEY_DOWN:
             self.proc_offset += 1
         elif key == curses.KEY_UP:
@@ -332,13 +318,13 @@ class App:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         if h < 6 or w < 40:
-            add(stdscr, 0, 0, "terminal too small", curses.color_pair(3))
+            add(stdscr, 0, 0, "terminal too small")
             stdscr.refresh()
             return
         self._header(stdscr, w)
-        rows = self._rows(w)
-        for i, (line, kind) in enumerate(rows):
-            add(stdscr, 1 + i, 0, line, curses.color_pair(kind), w - 1)
+        rows = self._rows()
+        for i, line in enumerate(rows):
+            add(stdscr, 1 + i, 0, line, width=w - 1)
         top = 1 + len(rows)
         self._layout(stdscr, top, h - top, w)
         if self.help:
@@ -348,20 +334,18 @@ class App:
     def _header(self, stdscr: curses.window, w: int) -> None:
         snap = self.snap
         if not snap or not snap.ready:
-            add(stdscr, 0, 0, " xtop  collecting…".ljust(w - 1), curses.color_pair(8) | curses.A_BOLD)
+            add(stdscr, 0, 0, " xtop  collecting…".ljust(w - 1), curses.A_BOLD)
             return
         load = "/".join(f"{v:.1f}" for v in snap.load)
         title = f" xtop {snap.host} up {uptime(snap.uptime)} load {load} tasks {snap.nproc}"
-        add(stdscr, 0, 0, title.ljust(w - 1), curses.color_pair(8) | curses.A_BOLD)
+        if snap.errors:
+            title += " !" + ",".join(sorted(snap.errors))
+        add(stdscr, 0, 0, title.ljust(w - 1), curses.A_BOLD)
 
-    def _rows(self, w: int) -> list[tuple[str, int]]:
-        tint = {"cpu": 2, "net": 4, "disk": 6, "gpu": 1}
-        rows = []
-        for name, group in self._section_lines(w):
-            rows.extend((line, tint[name]) for line in group)
-        return rows
+    def _rows(self) -> list[str]:
+        return [line for _, group in self._section_lines() for line in group]
 
-    def _section_lines(self, w: int) -> list[tuple[str, list[str]]]:
+    def _section_lines(self) -> list[tuple[str, list[str]]]:
         snap = self.snap
         if snap is None or not snap.ready:
             return [("cpu", ["collecting…"])]
@@ -369,35 +353,34 @@ class App:
         mem_pct = 100.0 * mem.used / mem.total if mem.total else 0.0
         used_n, used_u = sized(mem.used)
         total_n, total_u = sized(mem.total)
-        host = columns([
-            ("CPU", 0), (value(num(snap.cpu.total.busy, 5).strip(), "%", 6), 0),
-            ("MEM", 0), (value(num(mem_pct, 5).strip(), "%", 6), 0),
-            (value(used_n, used_u, 6), 0), ("/", 0), (value(total_n, total_u, 6), 1),
-        ], w)
+        host = (
+            f"CPU {value(num(snap.cpu.total.busy, 5).strip(), '%', 6)} "
+            f"MEM {value(num(mem_pct, 5).strip(), '%', 6)} "
+            f"{value(used_n, used_u, 6)}/{value(total_n, total_u, 6)}"
+        )
         net_lines = []
         for net in snap.nets:
             rx_n, rx_u = sized(net.rx_bps)
             tx_n, tx_u = sized(net.tx_bps)
-            net_lines.append(columns([
-                ("NET", 0), (net.name, 0),
-                ("rx", 0), (value(rx_n, rx_u + "/s", 9), 0),
-                ("tx", 0), (value(tx_n, tx_u + "/s", 9), 1),
-            ], w))
-        disk_lines = self._disk_lines(w)
+            net_lines.append(
+                f"NET {fixed(net.name, SUMMARY_NET_WIDTH)} rx {value(rx_n, rx_u + '/s', 9)} "
+                f"tx {value(tx_n, tx_u + '/s', 9)}"
+            )
+        disk_lines = self._disk_lines()
         gpu_lines = []
         if snap.gpu_error:
             gpu_lines.append(snap.gpu_error)
         for gpu in snap.gpus:
             used_n, used_u = sized((gpu.mem_used or 0.0) * 1024 * 1024)
             total_n, total_u = sized((gpu.mem_total or 0.0) * 1024 * 1024)
-            pct = 100.0 * (gpu.mem_used or 0.0) / gpu.mem_total if gpu.mem_total else 0.0
             temp = f"{gpu.temp:.0f}" if gpu.temp is not None else ""
             power = f"{gpu.power:.0f}" if gpu.power is not None else ""
-            gpu_lines.append(columns([
-                (f"GPU{gpu.index}", 0), (value(num(gpu.util or 0, 5).strip(), "%", 6), 0),
-                (value(used_n, used_u, 6), 0), ("/", 0), (value(total_n, total_u, 6), 0),
-                (value(temp, "C", 4), 0), (value(power, "W", 5), 1),
-            ], w))
+            gpu_lines.append(
+                f"{fixed(f'GPU{gpu.index}', SUMMARY_GPU_WIDTH)} "
+                f"{value(num(gpu.util or 0, 5).strip(), '%', 6)} "
+                f"{value(used_n, used_u, 6)}/{value(total_n, total_u, 6)} "
+                f"{value(temp, 'C', 4)} {value(power, 'W', 5)}"
+            )
         return [
             ("cpu", [host]),
             ("net", net_lines or ["none"]),
@@ -405,50 +388,48 @@ class App:
             ("gpu", gpu_lines or ["none"]),
         ]
 
-    def _disk_lines(self, width: int) -> list[str]:
+    def _disk_lines(self) -> list[str]:
         snap = self.snap
-        disks = []
+        lines = []
         for disk in snap.disks:
             name = disk.mounts.split(",")[0] if disk.mounts else disk.name
             free_n, free_u = sized(disk.free) if disk.total else ("-", "")
             total_n, total_u = sized(disk.total) if disk.total else ("-", "")
             read_n, read_u = sized(disk.read_bps)
             write_n, write_u = sized(disk.write_bps)
-            disks.append([
-                ("DSK", 0), (name, 1),
-                ("r", 0), (value(read_n, read_u + "/s", 9), 0),
-                ("w", 0), (value(write_n, write_u + "/s", 9), 0),
-                (value(free_n, free_u, 6), 0), (value(total_n, total_u, 6), 0),
-            ])
-        if not disks:
-            return []
-        widest = [0] * len(disks[0])
-        for row in disks:
-            for i, (text, _) in enumerate(row):
-                widest[i] = max(widest[i], len(text))
-        fixed = sum(widest[i] for i in range(len(disks[0])) if i != 1) + len(disks[0]) - 1
-        mount_w = max(1, width - fixed)
-        for row in disks:
-            row[1] = (fit(row[1][0], mount_w), 0)
-        return [columns(row, width) for row in pad(disks)]
+            lines.append(
+                f"DSK {fixed(name, SUMMARY_MOUNT_WIDTH)} r {value(read_n, read_u + '/s', 9)} "
+                f"w {value(write_n, write_u + '/s', 9)} "
+                f"{value(free_n, free_u, 6)} {value(total_n, total_u, 6)}"
+            )
+        return lines
 
     def _layout(self, stdscr: curses.window, top: int, height: int, width: int) -> None:
         rows = PRESETS[self.preset]
-        fixed = sum(h for h, _ in rows if h > 0)
         flex = [i for i, (h, _) in enumerate(rows) if h <= 0]
-        leftover = height - fixed
-        if leftover < len(flex):
-            # not enough rows: shrink fixed rows from the bottom
-            rows = [row for row in rows if row[0] <= 0 or True]
-        base = leftover // len(flex) if flex else 0
-        extra = leftover - base * len(flex) if flex else 0
-        if base < 3 and flex:
-            base = 3
+        heights = [0] * len(rows)
+
+        # Keep room for flexible panels. When the terminal is short, fixed
+        # panels at the bottom are shrunk or dropped first.
+        fixed_budget = max(0, height - 3 * len(flex))
+        for i, (requested, _) in enumerate(rows):
+            if requested <= 0:
+                continue
+            assigned = min(requested, fixed_budget)
+            heights[i] = assigned if assigned >= 3 else 0
+            fixed_budget -= heights[i]
+
+        leftover = max(0, height - sum(heights))
+        if flex:
+            base, extra = divmod(leftover, len(flex))
+            for n, i in enumerate(flex):
+                heights[i] = base + (1 if n < extra else 0)
+
         y = top
-        for i, (row_h, cells) in enumerate(rows):
-            h = row_h if row_h > 0 else base + (extra if i == flex[-1] else 0)
+        for i, (_, cells) in enumerate(rows):
+            h = heights[i]
             if y >= top + height or h <= 0:
-                break
+                continue
             h = min(h, top + height - y)
             if h < 3:
                 continue
@@ -480,18 +461,7 @@ class App:
             drawer(win, h, w, snap)
 
     def _cpu_bar(self, meter_obj, width: int) -> list[tuple[str, int]]:
-        # htop default order: nice system irq softirq steal guest io user
-        parts = [
-            (meter_obj.nice / 100, curses.color_pair(2)),
-            (meter_obj.system / 100, curses.color_pair(3)),
-            (meter_obj.irq / 100, curses.color_pair(4)),
-            (meter_obj.softirq / 100, curses.color_pair(5)),
-            (meter_obj.steal / 100, curses.color_pair(6)),
-            (meter_obj.guest / 100, curses.color_pair(9)),
-            (meter_obj.iowait / 100, curses.color_pair(10)),
-            (meter_obj.user / 100, curses.color_pair(1)),
-        ]
-        return meter(parts, width)
+        return meter([(meter_obj.busy / 100, 0)], width)
 
     def _draw_cpu(self, win: curses.window, h: int, width: int, snap: Snapshot) -> None:
         cpu = snap.cpu
@@ -503,27 +473,18 @@ class App:
             if i >= h:
                 break
             label = "CPU" if i == 0 else str(i - 1)
-            add(win, i, 0, f"{label:>{label_w}}", curses.color_pair(4))
-            put_meter(win, i, label_w + 1, self._cpu_bar(item, bar_w), curses.color_pair(1))
-            add(win, i, label_w + bar_w + 3, f"{item.busy:5.1f}%", curses.color_pair(7))
+            add(win, i, 0, f"{label:>{label_w}}")
+            put_meter(win, i, label_w + 1, self._cpu_bar(item, bar_w), 0)
+            add(win, i, label_w + bar_w + 3, f"{item.busy:5.1f}%")
 
     def _mem_bar(self, mem, width: int) -> list[tuple[str, int]]:
         total = mem.total or 1
-        parts = [
-            (mem.used / total, curses.color_pair(1)),
-            (mem.buffers / total, curses.color_pair(2)),
-            (mem.shared / total, curses.color_pair(3)),
-            (mem.cache / total, curses.color_pair(6)),
-        ]
-        return meter(parts, width)
+        shown = mem.used + mem.buffers + mem.shared + mem.cache
+        return meter([(shown / total, 0)], width)
 
     def _swap_bar(self, mem, width: int) -> list[tuple[str, int]]:
         total = mem.swap_total or 1
-        parts = [
-            (mem.swap_used / total, curses.color_pair(3)),
-            (mem.swap_cache / total, curses.color_pair(6)),
-        ]
-        return meter(parts, width)
+        return meter([((mem.swap_used + mem.swap_cache) / total, 0)], width)
 
     def _draw_mem(self, win: curses.window, h: int, width: int, snap: Snapshot) -> None:
         mem = snap.mem
@@ -531,14 +492,14 @@ class App:
         text = f"{htop_mem(mem.used)}/{htop_mem(mem.total)}"
         bar_w = max(4, width - label_w - len(text) - 4)
         if h >= 1:
-            add(win, 0, 0, " Mem", curses.color_pair(4))
-            put_meter(win, 0, label_w + 1, self._mem_bar(mem, bar_w), curses.color_pair(1))
-            add(win, 0, label_w + bar_w + 3, text, curses.color_pair(7))
+            add(win, 0, 0, " Mem")
+            put_meter(win, 0, label_w + 1, self._mem_bar(mem, bar_w), 0)
+            add(win, 0, label_w + bar_w + 3, text)
         if h >= 2:
             swap = f"{htop_mem(mem.swap_used)}/{htop_mem(mem.swap_total)}"
-            add(win, 1, 0, " Swp", curses.color_pair(4))
-            put_meter(win, 1, label_w + 1, self._swap_bar(mem, bar_w), curses.color_pair(3))
-            add(win, 1, label_w + bar_w + 3, swap, curses.color_pair(7))
+            add(win, 1, 0, " Swp")
+            put_meter(win, 1, label_w + 1, self._swap_bar(mem, bar_w), 0)
+            add(win, 1, label_w + bar_w + 3, swap)
 
     def _draw_proc(self, win: curses.window, h: int, width: int, snap: Snapshot) -> None:
         key = {"cpu": lambda p: p.cpu, "mem": lambda p: p.rss, "pid": lambda p: -p.pid}[self.sort]
@@ -548,7 +509,7 @@ class App:
             self.proc_offset = max(0, len(procs) - visible)
         shown = procs[self.proc_offset : self.proc_offset + visible]
         table = [[
-            ("PID", 2), (user_name("USER"), 0), ("%CPU", 2), ("%MEM", 2), ("RSS", 2), ("CMD", 1),
+            ("PID", 2), (user_name("USER"), 0), ("%CPU", 2), ("%MEM", 2), ("RSS", 2), ("COMMAND", 1),
         ]]
         for proc in shown:
             rss_n, rss_u = sized(proc.rss)
@@ -560,10 +521,10 @@ class App:
                 (proc.cmd, 1),
             ])
         table = pad(table)
-        lines = layout(table, width - 1)
+        lines = layout(table, width - 1, ellipsis=False)
         add(win, 0, 0, lines[0], curses.A_BOLD)
-        for i, (proc, line) in enumerate(zip(shown, lines[1:])):
-            add(win, 1 + i, 0, line, curses.color_pair(3) if proc.cpu >= 50 else 0)
+        for i, line in enumerate(lines[1:]):
+            add(win, 1 + i, 0, line)
 
     def _help(self, stdscr: curses.window, h: int, w: int) -> None:
         lines = [
@@ -572,7 +533,7 @@ class App:
             "布局写在 xtop/layout.py",
             "一行 = (高度, [(面板, 宽度权重), ...])",
             "高度 0 = 吃掉剩余空间",
-            "面板: cpu mem gpu disk net fs proc",
+            "面板: cpu mem proc",
             "",
             "q / esc   退出",
             "l         切换预设布局",
@@ -598,17 +559,20 @@ class App:
 def main(argv: list[str] | None = None) -> int:
     locale.setlocale(locale.LC_ALL, "")
     parser = argparse.ArgumentParser(prog="xtop", description="small resource monitor")
-    parser.add_argument("-d", "--delay", type=float, default=2.0, help="sample interval seconds")
+    parser.add_argument("-d", "--delay", type=float, default=1.0, help="host sample interval seconds")
+    parser.add_argument("--refresh", type=float, default=0.25, help="screen refresh interval seconds")
     parser.add_argument("-l", "--layout", default=PRESET_ORDER[0], choices=list(PRESETS), help="layout preset")
     parser.add_argument("-v", "--version", action="version", version=__version__)
     args = parser.parse_args(argv)
-    if args.delay <= 0:
-        parser.error("--delay must be > 0")
+    if args.delay < 0.2:
+        parser.error("--delay must be >= 0.2")
+    if args.refresh < 0.05:
+        parser.error("--refresh must be >= 0.05")
     if not sys.stdout.isatty():
         print("xtop needs a terminal", file=sys.stderr)
         return 1
     os.environ.setdefault("ESCDELAY", "25")
-    app = App(args.delay, args.layout)
+    app = App(args.delay, args.layout, args.refresh)
     try:
         curses.wrapper(app.run)
     except KeyboardInterrupt:

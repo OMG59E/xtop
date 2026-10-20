@@ -85,6 +85,7 @@ class GpuStat:
     temp: float | None
     power: float | None
     power_limit: float | None
+    uuid: str = ""
     procs: list[GpuProc] = field(default_factory=list)
 
 
@@ -149,6 +150,7 @@ class Snapshot:
     net_hist: list[float]
     disk_hist: list[float]
     ready: bool
+    errors: dict[str, str] = field(default_factory=dict)
 
 
 def _read(path: str) -> str:
@@ -379,10 +381,6 @@ def _mount_dev(source: str, dm_names: dict[str, str]) -> str:
                 return dm
         return ""
     return os.path.basename(os.path.realpath(source)) if source.startswith("/dev/") else ""
-    try:
-        return os.listdir(path)
-    except OSError:
-        return []
 
 
 def _dm_chain(dm: str, disk: str, parent: dict[str, str]) -> None:
@@ -392,28 +390,6 @@ def _dm_chain(dm: str, disk: str, parent: dict[str, str]) -> None:
             continue
         parent[holder] = disk
         _dm_chain(holder, disk, parent)
-    """name -> (read_bytes, write_bytes, io_ms). Sectors are 512 bytes."""
-    wanted = set(_block_devices())
-    out: dict[str, tuple[int, int, int]] = {}
-    try:
-        lines = _read("/proc/diskstats").splitlines()
-    except OSError:
-        return out
-    for line in lines:
-        parts = line.split()
-        if len(parts) < 14:
-            continue
-        name = parts[2]
-        if name not in wanted:
-            continue
-        try:
-            read_b = int(parts[5]) * 512
-            write_b = int(parts[9]) * 512
-            io_ms = int(parts[12])
-        except ValueError:
-            continue
-        out[name] = (read_b, write_b, io_ms)
-    return out
 
 
 def _ipv4_ifaces() -> set[str]:
@@ -427,7 +403,10 @@ def _ipv4_ifaces() -> set[str]:
     buf = ctypes.create_string_buffer(8192)
     ifconf = struct.pack("iP", ctypes.sizeof(buf), ctypes.addressof(buf))
     arr = ctypes.create_string_buffer(ifconf)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return set()
     try:
         if libc.ioctl(sock.fileno(), 0x8912, arr) < 0:  # SIOCGIFCONF
             return set()
@@ -639,6 +618,9 @@ class Collector:
         self.prev_disk: dict[str, tuple[int, int, int]] = {}
         self.prev_net: dict[str, tuple[int, int]] = {}
         self.prev_proc: dict[int, tuple[int, float]] = {}
+        self.disk_mounts: dict[str, list[str]] = {}
+        self.disk_usage: dict[str, tuple[int, int]] = {}
+        self.disk_order: dict[str, int] = {}
         self.users: dict[int, str] = {}
         self.cpu_hist: deque[float] = deque(maxlen=HIST)
         self.net_hist: deque[float] = deque(maxlen=HIST)
@@ -753,11 +735,18 @@ class Collector:
             swap_cache=swap_cache,
         )
 
-    def _disks(self, dt: float | None) -> list[DiskStat]:
+    def _refresh_disk_topology(self) -> None:
+        self.disk_mounts = _disk_mounts()
+        self.disk_usage = _disk_usage(self.disk_mounts)
+        self.disk_order = {name: index for index, name in enumerate(_block_devices())}
+
+    def _disks(self, dt: float | None, refresh_topology: bool = True) -> list[DiskStat]:
         cur = _diskstats()
         rows: list[DiskStat] = []
-        mounts = _disk_mounts()
-        usage = _disk_usage(mounts)
+        if refresh_topology or not self.disk_order:
+            self._refresh_disk_topology()
+        mounts = self.disk_mounts
+        usage = self.disk_usage
         if dt is not None:
             for name, (rb, wb, io) in cur.items():
                 prev = self.prev_disk.get(name)
@@ -776,7 +765,7 @@ class Collector:
                 )
         rows = [d for d in rows if d.mounts]
         self.prev_disk = cur
-        rows.sort(key=lambda d: _block_devices().index(d.name) if d.name in _block_devices() else 0)
+        rows.sort(key=lambda disk: self.disk_order.get(disk.name, len(self.disk_order)))
         return rows
 
     def _nets(self, dt: float | None) -> list[NetStat]:
