@@ -4,10 +4,23 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from xtop.collect import Collector, CpuMeter, GpuStat, _cpu_meter, _parse_stat_line
+from xtop.collect import Collector, CpuMeter, GpuStat, IpuStat, _cpu_meter, _parse_stat_line
 from xtop.layout import PRESETS, PRESET_ORDER
 from xtop.monitor import Monitor
-from xtop.ui import App, columns, compact, fixed, htop_mem, human, layout, pad, rate, spark
+from xtop.ui import (
+    WIDE_SUMMARY_MIN_WIDTH,
+    App,
+    columns,
+    compact,
+    fixed,
+    htop_mem,
+    human,
+    layout,
+    pad,
+    rate,
+    spark,
+    summary_left_width,
+)
 
 
 class FormatTest(unittest.TestCase):
@@ -101,9 +114,9 @@ class LayoutTest(unittest.TestCase):
             nets=[], disks=[], gpus=[gpu], gpu_error="", ipus=[], ipu_error="",
         )
 
-        narrow = app._rows(111, 24)
-        edge = app._rows(112, 24)
-        wide = app._rows(120, 24)
+        narrow = app._rows(WIDE_SUMMARY_MIN_WIDTH - 1, 24)
+        edge = app._rows(WIDE_SUMMARY_MIN_WIDTH, 24)
+        wide = app._rows(WIDE_SUMMARY_MIN_WIDTH + 8, 24)
 
         self.assertFalse(any(" │ " in line for line in narrow))
         self.assertTrue(any(" │ " in line for line in edge))
@@ -111,6 +124,46 @@ class LayoutTest(unittest.TestCase):
         self.assertTrue(any("GPU0" in line for line in wide))
         self.assertTrue(any("COMMAND" in line for line in wide))
         self.assertTrue(any("python train.py" in line for line in wide))
+        self.assertTrue(all(line.index(" │ ") == 48 for line in edge))
+
+    def test_wide_summary_divider_tracks_left_content_with_limits(self):
+        self.assertEqual(summary_left_width(["short"]), 48)
+        self.assertEqual(summary_left_width(["x" * 54]), 54)
+        self.assertEqual(summary_left_width(["x" * 100]), 62)
+
+    def test_network_and_mount_share_current_width_capped_at_19(self):
+        app = App.__new__(App)
+        app.snap = SimpleNamespace(
+            ready=True,
+            mem=SimpleNamespace(used=1024, total=8192),
+            cpu=SimpleNamespace(total=SimpleNamespace(busy=25)),
+            nets=[SimpleNamespace(name="10.64.35.39", rx_bps=1, tx_bps=2)],
+            disks=[SimpleNamespace(
+                name="sda", mounts="/data04", read_bps=3,
+                write_bps=4, free=5, total=6,
+            )],
+            gpus=[], gpu_error="", ipus=[], ipu_error="",
+        )
+
+        sections = dict(app._section_lines())
+        net = sections["net"][0]
+        disk = sections["disk"][0]
+
+        self.assertEqual(net[4:15], "10.64.35.39")
+        self.assertEqual(net[15:18], "  ↑")
+        self.assertLess(net.index("2B/s", 18), net.index("1B/s", 18))
+        self.assertEqual(disk[4:15], "/data04".ljust(11))
+        self.assertEqual(disk[15:18], "  r")
+
+        app.snap.disks[0].mounts = "/12345678901234567890"
+        sections = dict(app._section_lines())
+        net = sections["net"][0]
+        disk = sections["disk"][0]
+
+        self.assertEqual(net[4:23], "10.64.35.39".ljust(19))
+        self.assertEqual(net[23:26], "  ↑")
+        self.assertEqual(disk[4:23], "/123456789012345678")
+        self.assertEqual(disk[23:26], "  r")
 
 
 class CollectorTest(unittest.TestCase):
@@ -173,10 +226,27 @@ class _CountingGpu:
         pass
 
 
+class _PartialIpu:
+    interval = 0.04
+
+    def __init__(self):
+        self.calls = 0
+        self.closed = False
+
+    def metrics(self):
+        self.calls += 1
+        if self.calls == 1:
+            return [IpuStat(0, 10, 100, 1000, 20), IpuStat(1, 11, 200, 1000, 21)], ""
+        return [IpuStat(0, 30, 300, 1000, 23)], "IPU1: metrics 9"
+
+    def close(self):
+        self.closed = True
+
+
 class MonitorTest(unittest.TestCase):
     def test_gpu_failure_keeps_last_good_snapshot(self):
         gpu = _FailingGpu()
-        monitor = Monitor(0.2, gpu_provider=gpu)
+        monitor = Monitor(0.2, gpu_provider=gpu, ipu_provider=None)
         monitor.start()
         try:
             deadline = time.monotonic() + 2
@@ -195,7 +265,7 @@ class MonitorTest(unittest.TestCase):
 
     def test_gpu_metrics_and_processes_have_independent_frequencies(self):
         gpu = _CountingGpu()
-        monitor = Monitor(0.2, gpu_provider=gpu)
+        monitor = Monitor(0.2, gpu_provider=gpu, ipu_provider=None)
         monitor.start()
         try:
             time.sleep(0.28)
@@ -204,6 +274,27 @@ class MonitorTest(unittest.TestCase):
         self.assertGreaterEqual(gpu.metric_calls, 3)
         self.assertGreaterEqual(gpu.process_calls, 2)
         self.assertLess(gpu.process_calls, gpu.metric_calls)
+
+    def test_ipu_partial_failure_updates_healthy_and_retains_failed_device(self):
+        ipu = _PartialIpu()
+        monitor = Monitor(0.2, gpu_provider=_CountingGpu(), ipu_provider=ipu)
+        monitor.start()
+        try:
+            deadline = time.monotonic() + 2
+            snap = None
+            while time.monotonic() < deadline:
+                snap = monitor.snapshot()
+                if snap and snap.ipu_error:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(snap)
+            self.assertEqual(snap.ipu_error, "IPU1: metrics 9")
+            self.assertEqual([item.index for item in snap.ipus], [0, 1])
+            self.assertEqual(snap.ipus[0].util, 30)
+            self.assertEqual(snap.ipus[1].util, 11)
+        finally:
+            monitor.close()
+        self.assertTrue(ipu.closed)
 
 
 if __name__ == "__main__":

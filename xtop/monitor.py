@@ -10,6 +10,8 @@ from .collect import Collector, CpuStat, MemStat, Snapshot, _mounts
 from .gpu import make_gpu_provider
 from .ipu import make_ipu_provider
 
+_AUTO_IPU = object()
+
 
 @dataclass(frozen=True)
 class PollIntervals:
@@ -45,12 +47,12 @@ class _State:
 class Monitor:
     """Collect without blocking the UI; retain last-good data on failures."""
 
-    def __init__(self, interval: float = 1.0, gpu_provider=None) -> None:
+    def __init__(self, interval: float = 1.0, gpu_provider=None, ipu_provider=_AUTO_IPU) -> None:
         base = max(0.2, interval)
         self.intervals = PollIntervals(system=base, io=base, process=base)
         self.collector = Collector()
         self.gpu = gpu_provider if gpu_provider is not None else make_gpu_provider()
-        self.ipu = make_ipu_provider()
+        self.ipu = make_ipu_provider() if ipu_provider is _AUTO_IPU else ipu_provider
         self.state = _State()
         self._snapshot: Snapshot | None = None
         self._lock = threading.Lock()
@@ -150,6 +152,16 @@ class Monitor:
             seen = {identity(gpu) for gpu in rows}
             merged.extend(gpu for key, gpu in old.items() if key not in seen)
         self.state.gpus = merged
+
+    def _set_ipu_metrics_locked(self, rows: list, retain_missing: bool = False) -> None:
+        """Accept healthy IPUs while retaining last-good data for failed devices."""
+        old = {ipu.index: ipu for ipu in self.state.ipus}
+        merged = list(rows)
+        if retain_missing:
+            seen = {ipu.index for ipu in rows}
+            merged.extend(ipu for index, ipu in old.items() if index not in seen)
+            merged.sort(key=lambda ipu: ipu.index)
+        self.state.ipus = merged
 
     def _host_loop(self) -> None:
         intervals = self.intervals
@@ -277,14 +289,17 @@ class Monitor:
                 try:
                     rows, error = self.ipu.metrics()
                 except Exception as exc:
-                    rows, error = [], str(exc)
+                    rows = []
+                    error = str(exc).strip() or exc.__class__.__name__
                 if error:
                     failures += 1
                 else:
                     failures = 0
                 with self._lock:
-                    if not error:
-                        self.state.ipus = rows
+                    if rows:
+                        self._set_ipu_metrics_locked(rows, retain_missing=bool(error))
+                    elif not error:
+                        self._set_ipu_metrics_locked([])
                     self.state.ipu_error = error
                     self._publish_locked()
                 due = now + self._delay(self.ipu.interval, failures)

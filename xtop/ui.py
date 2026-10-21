@@ -15,14 +15,14 @@ from .monitor import Monitor
 
 PANELS = ("cpu", "mem", "gpu", "disk", "net", "fs", "proc")
 SORTS = ("cpu", "mem", "pid")
-SUMMARY_NET_WIDTH = 16
-SUMMARY_MOUNT_WIDTH = 16
+SUMMARY_DEVICE_MAX_WIDTH = 19
 SUMMARY_GPU_WIDTH = 5
-SUMMARY_LEFT_WIDTH = 60
+SUMMARY_LEFT_MIN_WIDTH = 48
+SUMMARY_LEFT_MAX_WIDTH = 62
 GPU_PANEL_MIN_WIDTH = 48
 SUMMARY_SEPARATOR = " │ "
 WIDE_SUMMARY_MIN_WIDTH = (
-    SUMMARY_LEFT_WIDTH + len(SUMMARY_SEPARATOR) + GPU_PANEL_MIN_WIDTH + 1
+    SUMMARY_LEFT_MIN_WIDTH + len(SUMMARY_SEPARATOR) + GPU_PANEL_MIN_WIDTH + 1
 )
 PROC_HEADER_PAIR = 1
 
@@ -154,6 +154,12 @@ def value(number: str, unit: str, width: int) -> str:
 def fixed(text: str, width: int) -> str:
     """A fixed-width summary cell, cropped without an ellipsis."""
     return text[:width].ljust(width)
+
+
+def summary_left_width(lines: list[str]) -> int:
+    """Fit the host summary without letting errors or long names move GPU too far."""
+    content = max((len(line) for line in lines), default=0)
+    return min(SUMMARY_LEFT_MAX_WIDTH, max(SUMMARY_LEFT_MIN_WIDTH, content))
 
 
 def compact(n: float) -> str:
@@ -375,19 +381,23 @@ class App:
     def _rows(self, width: int, height: int) -> list[str]:
         sections = self._section_lines()
         snap = self.snap
-        if not snap or not snap.ready or not snap.gpus or width < WIDE_SUMMARY_MIN_WIDTH:
+        if not snap or not snap.ready or not snap.gpus:
             return [line for _, group in sections for line in group]
 
         left = [line for name, group in sections if name != "gpu" for line in group]
+        left_width = summary_left_width(left)
+        required = left_width + len(SUMMARY_SEPARATOR) + GPU_PANEL_MIN_WIDTH + 1
+        if width < required:
+            return [line for _, group in sections for line in group]
         max_gpu_rows = max(4, min(10, height // 3))
         right = self._gpu_panel_lines(max_gpu_rows)
-        right_width = width - SUMMARY_LEFT_WIDTH - len(SUMMARY_SEPARATOR) - 1
+        right_width = width - left_width - len(SUMMARY_SEPARATOR) - 1
         rows = []
         for index in range(max(len(left), len(right))):
             left_line = left[index] if index < len(left) else ""
             right_line = right[index] if index < len(right) else ""
             rows.append(
-                fixed(left_line, SUMMARY_LEFT_WIDTH)
+                fixed(left_line, left_width)
                 + SUMMARY_SEPARATOR
                 + right_line[:right_width]
             )
@@ -407,14 +417,23 @@ class App:
             f"{value(used_n, used_u + ' / ', 10)}{total_n}{total_u}"
         )
         net_lines = []
+        device_names = [net.name for net in snap.nets]
+        device_names.extend(
+            disk.mounts.split(",")[0] if disk.mounts else disk.name
+            for disk in snap.disks
+        )
+        device_width = min(
+            SUMMARY_DEVICE_MAX_WIDTH,
+            max((len(name) for name in device_names), default=0),
+        )
         for net in snap.nets:
             rx_n, rx_u = sized(net.rx_bps)
             tx_n, tx_u = sized(net.tx_bps)
             net_lines.append(
-                f"NET {fixed(net.name, SUMMARY_NET_WIDTH)} ↑ {value(rx_n, rx_u + '/s', 9)} "
-                f"↓ {value(tx_n, tx_u + '/s', 9)}"
+                f"NET {fixed(net.name, device_width)}  ↑ {value(tx_n, tx_u + '/s', 9)} "
+                f"↓ {value(rx_n, rx_u + '/s', 9)}"
             )
-        disk_lines = self._disk_lines()
+        disk_lines = self._disk_lines(device_width)
         ipu_lines = self._ipu_lines()
         if snap.ipu_error:
             ipu_lines.insert(0, snap.ipu_error)
@@ -499,7 +518,7 @@ class App:
             lines.append(f"+{hidden} more")
         return lines
 
-    def _disk_lines(self) -> list[str]:
+    def _disk_lines(self, device_width: int) -> list[str]:
         snap = self.snap
         lines = []
         for disk in snap.disks:
@@ -509,7 +528,7 @@ class App:
             read_n, read_u = sized(disk.read_bps)
             write_n, write_u = sized(disk.write_bps)
             lines.append(
-                f"DSK {fixed(name, SUMMARY_MOUNT_WIDTH)} r {value(read_n, read_u + '/s', 9)} "
+                f"DSK {fixed(name, device_width)}  r {value(read_n, read_u + '/s', 9)} "
                 f"w {value(write_n, write_u + '/s', 9)} "
                 f"{value(free_n, free_u, 6)} {value(total_n, total_u, 6)}"
             )
