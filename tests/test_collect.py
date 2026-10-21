@@ -3,6 +3,7 @@
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from xtop.collect import Collector, CpuMeter, GpuStat, IpuStat, _cpu_meter, _parse_stat_line
 from xtop.layout import PRESETS, PRESET_ORDER
@@ -124,10 +125,10 @@ class LayoutTest(unittest.TestCase):
         self.assertTrue(any("GPU0" in line for line in wide))
         self.assertTrue(any("COMMAND" in line for line in wide))
         self.assertTrue(any("python train.py" in line for line in wide))
-        self.assertTrue(all(line.index(" │ ") == 48 for line in edge))
+        self.assertTrue(all(line.index(" │ ") == 40 for line in edge))
 
     def test_wide_summary_divider_tracks_left_content_with_limits(self):
-        self.assertEqual(summary_left_width(["short"]), 48)
+        self.assertEqual(summary_left_width(["short"]), 40)
         self.assertEqual(summary_left_width(["x" * 54]), 54)
         self.assertEqual(summary_left_width(["x" * 100]), 62)
 
@@ -144,6 +145,7 @@ class LayoutTest(unittest.TestCase):
             )],
             gpus=[], gpu_error="", ipus=[], ipu_error="",
         )
+        app.show_disk_rate = True
 
         sections = dict(app._section_lines())
         net = sections["net"][0]
@@ -165,6 +167,18 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(disk[4:23], "/123456789012345678")
         self.assertEqual(disk[23:26], "  r")
 
+    def test_disk_rates_are_hidden_by_default(self):
+        app = App.__new__(App)
+        app.snap = SimpleNamespace(disks=[SimpleNamespace(
+            name="sda", mounts="/data", read_bps=1024, write_bps=2048,
+            free=3 * 1024**3, total=4 * 1024**3,
+        )])
+
+        line = app._disk_lines(5)[0]
+
+        self.assertEqual(line, "DSK /data    3.0G   4.0G")
+        self.assertNotIn("/s", line)
+
 
 class CollectorTest(unittest.TestCase):
     def test_two_samples(self):
@@ -181,6 +195,29 @@ class CollectorTest(unittest.TestCase):
         self.assertGreater(second.mem.total, second.mem.used)
         self.assertTrue(second.mounts)
         self.assertTrue(second.host)
+
+    def test_disks_are_sorted_by_mount_name(self):
+        collector = Collector()
+        collector.disk_order = {"sda": 0, "sdb": 1, "sdc": 2}
+        collector.disk_mounts = {
+            "sda": ["/zeta"],
+            "sdb": ["/alpha"],
+            "sdc": ["/middle"],
+        }
+        collector.disk_usage = {
+            name: (1024, 512) for name in collector.disk_order
+        }
+        collector.prev_disk = {
+            name: (0, 0, 0) for name in collector.disk_order
+        }
+        counters = {
+            name: (1024, 2048, 10) for name in collector.disk_order
+        }
+
+        with patch("xtop.collect._diskstats", return_value=counters):
+            disks = collector._disks(1.0, refresh_topology=False)
+
+        self.assertEqual([disk.mounts for disk in disks], ["/alpha", "/middle", "/zeta"])
 
 
 class _FailingGpu:

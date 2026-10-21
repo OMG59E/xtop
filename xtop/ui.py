@@ -17,7 +17,7 @@ PANELS = ("cpu", "mem", "gpu", "disk", "net", "fs", "proc")
 SORTS = ("cpu", "mem", "pid")
 SUMMARY_DEVICE_MAX_WIDTH = 19
 SUMMARY_GPU_WIDTH = 5
-SUMMARY_LEFT_MIN_WIDTH = 48
+SUMMARY_LEFT_MIN_WIDTH = 40
 SUMMARY_LEFT_MAX_WIDTH = 62
 GPU_PANEL_MIN_WIDTH = 48
 SUMMARY_SEPARATOR = " │ "
@@ -263,7 +263,13 @@ def add(win: curses.window, y: int, x: int, text: str, attr: int = 0, width: int
 
 
 class App:
-    def __init__(self, interval: float, preset: str, refresh: float = 3.0) -> None:
+    def __init__(
+        self,
+        interval: float,
+        preset: str,
+        refresh: float = 3.0,
+        show_disk_rate: bool = False,
+    ) -> None:
         self.interval = interval
         self.refresh_interval = refresh
         self.monitor = Monitor(interval)
@@ -275,6 +281,7 @@ class App:
         self.help = False
         self.proc_header_attr = curses.A_REVERSE
         self.refresh_pending = False
+        self.show_disk_rate = show_disk_rate
 
     def run(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
@@ -525,13 +532,16 @@ class App:
             name = disk.mounts.split(",")[0] if disk.mounts else disk.name
             free_n, free_u = sized(disk.free) if disk.total else ("-", "")
             total_n, total_u = sized(disk.total) if disk.total else ("-", "")
-            read_n, read_u = sized(disk.read_bps)
-            write_n, write_u = sized(disk.write_bps)
-            lines.append(
-                f"DSK {fixed(name, device_width)}  r {value(read_n, read_u + '/s', 9)} "
-                f"w {value(write_n, write_u + '/s', 9)} "
-                f"{value(free_n, free_u, 6)} {value(total_n, total_u, 6)}"
-            )
+            prefix = f"DSK {fixed(name, device_width)}  "
+            capacity = f"{value(free_n, free_u, 6)} {value(total_n, total_u, 6)}"
+            if getattr(self, "show_disk_rate", False):
+                read_n, read_u = sized(disk.read_bps)
+                write_n, write_u = sized(disk.write_bps)
+                prefix += (
+                    f"r {value(read_n, read_u + '/s', 9)} "
+                    f"w {value(write_n, write_u + '/s', 9)} "
+                )
+            lines.append(prefix + capacity)
         return lines
 
     def _layout(self, stdscr: curses.window, top: int, height: int, width: int) -> None:
@@ -691,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="xtop", description="small resource monitor")
     parser.add_argument("-d", "--delay", type=float, default=1.0, help="host sample interval seconds")
     parser.add_argument("--refresh", type=float, default=3.0, help="screen refresh interval seconds")
+    parser.add_argument("--disk-rate", action="store_true", help="show disk read/write rates")
     parser.add_argument("-l", "--layout", default=PRESET_ORDER[0], choices=list(PRESETS), help="layout preset")
     parser.add_argument("-v", "--version", action="version", version=__version__)
     args = parser.parse_args(argv)
@@ -702,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         print("xtop needs a terminal", file=sys.stderr)
         return 1
     os.environ.setdefault("ESCDELAY", "25")
-    app = App(args.delay, args.layout, args.refresh)
+    app = App(args.delay, args.layout, args.refresh, args.disk_rate)
     try:
         curses.wrapper(app.run)
     except KeyboardInterrupt:

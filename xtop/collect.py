@@ -776,7 +776,7 @@ class Collector:
                 )
         rows = [d for d in rows if d.mounts]
         self.prev_disk = cur
-        rows.sort(key=lambda disk: self.disk_order.get(disk.name, len(self.disk_order)))
+        rows.sort(key=lambda disk: disk.mounts.split(",", 1)[0])
         return rows
 
     def _nets(self, dt: float | None) -> list[NetStat]:
